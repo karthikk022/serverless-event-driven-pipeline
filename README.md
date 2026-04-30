@@ -338,4 +338,4 @@ For questions or support, please open an issue in the GitHub repository.
 
 ---
 
-**Built with** Terraform, AWS Lambda, EventBridge, Step Functions, DynamoDB, S3, X-Ray, React, TypeScript, and Tailwind CSS.
+**Built with** Terraform, AWS Lambda, EventBridge, Step Functions, DynamoDB, S3, X-Ray, React, TypeScript, and Tailwind CSS. 
