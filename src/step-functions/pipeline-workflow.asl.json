@@ -1,0 +1,226 @@
+{
+  "Comment": "Serverless Event Pipeline - Image Processing Workflow",
+  "StartAt": "ValidateInput",
+  "States": {
+    "ValidateInput": {
+      "Type": "Task",
+      "Resource": "${lambda_validate_arn}",
+      "Comment": "Validate the input data before processing",
+      "Next": "IsValid",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.validationError",
+          "Next": "ValidationErrorHandler"
+        }
+      ],
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ]
+    },
+    "IsValid": {
+      "Type": "Choice",
+      "Comment": "Check if input passed validation",
+      "Choices": [
+        {
+          "Variable": "$.isValid",
+          "BooleanEquals": true,
+          "Next": "ParallelProcessing"
+        }
+      ],
+      "Default": "ValidationFailed"
+    },
+    "ValidationFailed": {
+      "Type": "Fail",
+      "Comment": "Input validation failed",
+      "Error": "ValidationFailed",
+      "Cause": "The input data did not pass validation checks"
+    },
+    "ParallelProcessing": {
+      "Type": "Parallel",
+      "Comment": "Run transformation and enrichment in parallel",
+      "Next": "MergeResults",
+      "Branches": [
+        {
+          "StartAt": "TransformData",
+          "States": {
+            "TransformData": {
+              "Type": "Task",
+              "Resource": "${lambda_transform_arn}",
+              "Comment": "Transform data into standardized format",
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                },
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 3,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.transformError",
+                  "Next": "TransformError"
+                }
+              ]
+            },
+            "TransformError": {
+              "Type": "Pass",
+              "Comment": "Transform failed, return error info",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "EnrichData",
+          "States": {
+            "EnrichData": {
+              "Type": "Task",
+              "Resource": "${lambda_enrich_arn}",
+              "Comment": "Enrich data with additional metadata",
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                },
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 3,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.enrichError",
+                  "Next": "EnrichError"
+                }
+              ]
+            },
+            "EnrichError": {
+              "Type": "Pass",
+              "Comment": "Enrichment failed, return error info",
+              "End": true
+            }
+          }
+        }
+      ]
+    },
+    "MergeResults": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_transform_arn}",
+        "Payload": {
+          "action": "merge",
+          "transformResult.$": "$.[0]",
+          "enrichResult.$": "$.[1]"
+        }
+      },
+      "Comment": "Merge parallel processing results",
+      "Next": "NotifyCompletion",
+      "ResultPath": "$.mergeResult",
+      "ResultSelector": {
+        "mergedData.$": "$.Payload"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ]
+    },
+    "NotifyCompletion": {
+      "Type": "Task",
+      "Resource": "${lambda_notify_arn}",
+      "Comment": "Send notification about pipeline completion",
+      "Next": "EmitSuccessEvent",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.notifyError",
+          "Next": "EmitSuccessEvent"
+        }
+      ]
+    },
+    "EmitSuccessEvent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          {
+            "Detail": {
+              "status": "COMPLETED",
+              "imageId.$": "$.imageId",
+              "timestamp.$": "States.ArrayGetItem(States.StringSplit(States.ArrayGetItem(States.StringSplit(States.StateEnteredTime, 'T'), 1), '.'), 0)"
+            },
+            "DetailType": "PipelineCompleted",
+            "EventBusName": "${event_bus_name}",
+            "Source": "serverless.pipeline.workflow"
+          }
+        ]
+      },
+      "Comment": "Emit success event to EventBridge",
+      "End": true
+    },
+    "ValidationErrorHandler": {
+      "Type": "Task",
+      "Resource": "${lambda_error_handler_arn}",
+      "Comment": "Handle validation errors",
+      "Parameters": {
+        "Error": "ValidationError",
+        "Cause.$": "States.JsonToString($.validationError)",
+        "input.$": "$"
+      },
+      "Next": "EmitFailureEvent",
+      "ResultPath": "$.errorResult"
+    },
+    "EmitFailureEvent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          {
+            "Detail": {
+              "status": "FAILED",
+              "imageId.$": "$.imageId",
+              "error.$": "$.errorResult.error",
+              "cause.$": "$.errorResult.cause"
+            },
+            "DetailType": "PipelineFailed",
+            "EventBusName": "${event_bus_name}",
+            "Source": "serverless.pipeline.workflow"
+          }
+        ]
+      },
+      "Comment": "Emit failure event to EventBridge",
+      "End": true
+    }
+  }
+}
